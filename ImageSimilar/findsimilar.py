@@ -5,6 +5,7 @@ import time
 import json
 import shutil
 import os
+import tqdm as tq
 
 from collections import defaultdict
 from einops import rearrange
@@ -64,11 +65,13 @@ def cv_imread(filePath):
 def get_target_array(search_dir):
     search_img_list = list_all_files(search_dir)
     all_target_vector_lst = []
-    #     hw_info_lst = []
-    for i in search_img_list:
-        target = cv_imread(i)
-        #         hw_info_lst.append()
-        target_vector = rearrange(make_pixel_bucket(target), 'a b c d -> (a b c d)')
+    for i in tq.tqdm(range(len(search_img_list))):  # for i in search_img_list:
+        try:
+            target = cv_imread(search_img_list[i])
+            target_vector = rearrange(make_pixel_bucket(target), 'a b c d -> (a b c d)')
+        except:
+            print('Cannot load the target image:', search_img_list[i])
+            target_vector = np.zeros(4608)
         all_target_vector_lst.append(target_vector)
     all_target_vector = np.stack(all_target_vector_lst, axis=0)
     np.savetxt('target_image_array.txt', all_target_vector, fmt='%d')
@@ -79,37 +82,73 @@ def get_target_array(search_dir):
 
 def get_source_array(source_img_list):
     all_source_vector_lst = []
-    for i in source_img_list:
-        source = cv_imread(i)
-        source_vector = rearrange(make_pixel_bucket(source), 'a b c d -> (a b c d)')
+    for i in tq.tqdm(range(len(source_img_list))):   # for i in source_img_list:
+        try:
+            source = cv_imread(source_img_list[i])
+            source_vector = rearrange(make_pixel_bucket(source), 'a b c d -> (a b c d)')
+        except:
+            print('Cannot load the source image:', source_img_list[i])
+            source_vector = np.zeros(4608)
         all_source_vector_lst.append(source_vector)
     all_source_vector = np.stack(all_source_vector_lst, axis=0)
+
     return all_source_vector
 
 
 def update_check(search_dir):
     with open('name_info.json', 'r') as openfile:
         name_info = json.load(openfile)
-    for i in name_info:
-        if not os.path.exists(i):
-            return True
-    return False
+    current_files = list_all_files(search_dir)
+    missing_index = []
+    missing_vector = []
+    need_update = False
+    for i in tq.tqdm(range(len(current_files))):
+        if current_files[i] not in name_info:
+            need_update = True
+            missing_index.append(i)
+            missing_target = cv_imread(current_files[i])
+            missing_target_vector = rearrange(make_pixel_bucket(missing_target), 'a b c d -> (a b c d)')
+            missing_vector.append(missing_target_vector)
+    return need_update, missing_index, missing_vector
+
+
+def update(missing_index, missing_vector):
+    old_target_array = np.loadtxt('target_image_array.txt', dtype=int)
+    old_target_array = list(old_target_array)
+    for i in tq.tqdm(range(len(missing_index))):
+        old_target_array.insert(missing_index[i], missing_vector[i])
+    all_target_vector = np.stack(old_target_array, axis=0)
+    np.savetxt('target_image_array.txt', all_target_vector, fmt='%d')
 
 
 def find_similar(search_dir, source_dir):
-    if not os.path.exists('target_image_array.json'):
+    print('==== Checking if generating target array needed ====')
+    if not os.path.exists('target_image_array.txt'):
+        print('======= Getting the target image array =======')
         get_target_array(search_dir)
+        print('\n')
+    else:
+        print('======= Target array already existed =======\n')
 
-    need_update = update_check(search_dir)
+    print('======= Check if updating needed =======')
+    need_update, missing_index, missing_vector = update_check(search_dir)
 
     if need_update:
-        get_target_array(search_dir)
+        print('======= Need update and updating =======')
+        update(missing_index, missing_vector)
+        print('\n')
+    else:
+        print('\n========== No updating needed ==========\n')
 
+    print('======= Getting the source image names =======')
     source_img_list = list_all_files(source_dir)
+    print('============= Done =============\n')
+
     # create store folder
     if not os.path.exists(source_dir + 'find/'):
         os.mkdir(source_dir + 'find/')
 
+    print('======= Getting the source image array =======')
     source_array = get_source_array(source_img_list)
     target_array = np.loadtxt('target_image_array.txt', dtype=int)
 
@@ -118,7 +157,8 @@ def find_similar(search_dir, source_dir):
 
     similar_score = np.matmul(source_array, target_array.T)
 
-    for i in range(source_array.shape[0]):
+    print('\n\n========== Comparing the Images ==========')
+    for i in tq.tqdm(range(source_array.shape[0])):  # for i in range(source_array.shape[0]):
         # make dir
         path = source_img_list[i].split('/')
         path[-1] = 'find'
