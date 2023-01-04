@@ -1,3 +1,6 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,10 +9,22 @@ import json
 import shutil
 import os
 from tqdm import tqdm
+from torchvision import models
 import pdb
 
 from collections import defaultdict
 from einops import rearrange
+
+resnet = models.resnet50(pretrained=True)
+global Conv
+Conv = nn.Sequential(
+    resnet.conv1,
+    resnet.bn1,
+    resnet.relu,
+    resnet.maxpool,
+    resnet.layer1,
+    resnet.layer2
+    )
 
 
 def list_all_files(rootdir):
@@ -45,16 +60,20 @@ def get_square_position(x, y, width, height):
 
 
 def make_pixel_bucket(image):
-    check = np.zeros((8, 8, 8, 9))
+#     check = np.zeros((8, 8, 8, 9))
+    check = np.zeros((8, 9))
     h, w, _ = image.shape
-    h1 = h // 100
-    w1 = w // 100
-    for i in range(h1, h, h1):
-        for j in range(w1, w, w1):
+#     h1 = h // 2
+#     w1 = w // 2
+#     for i in range(h1, h, h1):
+    for i in range(h):
+#         for j in range(w1, w, w1):
+        for j in range(w):
             square_position = get_square_position(i, j, h, w)
             pixel = image[i][j]
             # >> 5 equals // 5(integer division of 5)
-            check[pixel[0] >> 5][pixel[1] >> 5][pixel[2] >> 5][square_position] += 1
+#             check[pixel[0]>>5][pixel[1]>>5][pixel[2]>>5][square_position] += 1
+            check[pixel[0]>>5][square_position] += 1
     return check
 
 
@@ -69,32 +88,47 @@ def get_target_array(search_dir):
     all_target_vector_lst = []
     for i in tqdm(range(len(search_img_list))):  # for i in search_img_list:
         try:
-            target = cv_imread(search_img_list[i])
-            target_vector = rearrange(make_pixel_bucket(target), 'a b c d -> (a b c d)')
+            target = read_handle(search_img_list[i], Conv)
+            target_vector = rearrange(make_pixel_bucket(target), 'a b -> (a b)')
         except:
             print('Cannot load the target image:', search_img_list[i])
-            target_vector = np.zeros(4608)
+            target_vector = np.zeros(72)
         all_target_vector_lst.append(target_vector)
     all_target_vector = np.stack(all_target_vector_lst, axis=0)
     np.savetxt('target_image_array.txt', all_target_vector, fmt='%d')
-
+    
     with open('name_info.json', 'w') as f:
         json.dump(search_img_list, f)
 
 
 def get_source_array(source_img_list):
     all_source_vector_lst = []
-    for i in tqdm(range(len(source_img_list))):  # for i in source_img_list:
+    for i in tqdm(range(len(source_img_list))):   # for i in source_img_list:
         try:
-            source = cv_imread(source_img_list[i])
-            source_vector = rearrange(make_pixel_bucket(source), 'a b c d -> (a b c d)')
+            source = read_handle(source_img_list[i], Conv)
+            source_vector = rearrange(make_pixel_bucket(source), 'a b -> (a b)')
         except:
             print('Cannot load the source image:', source_img_list[i])
-            source_vector = np.zeros(4608)
+            source_vector = np.zeros(72)
         all_source_vector_lst.append(source_vector)
     all_source_vector = np.stack(all_source_vector_lst, axis=0)
 
     return all_source_vector
+
+
+def read_handle(img_name, model):
+    # read img
+    img = cv_imread(img_name)
+    # reshape
+    img = torch.from_numpy(rearrange(np.float32(img), 'h w c -> c h w')).unsqueeze(0)
+    # pass the conv
+    out = torch.sum(model(img), dim=1)
+    # expand to the 0-255 range
+    out = (out - torch.min(out))
+    out = out * (255 / torch.max(out))
+    # back to the shape to make pixel bucket
+    out = rearrange(out, 'c h w -> h w c').detach().numpy().astype(int)
+    return out
 
 
 def update_check(search_dir):
@@ -111,9 +145,9 @@ def update_check(search_dir):
         if current_files[i] not in name_info:
             need_update = True
             missing_index.append(i)
-            missing_target = cv_imread(current_files[i])
+            missing_target = read_handle(current_files[i], Conv)
             missing_file_name.append(current_files[i])
-            missing_target_vector = rearrange(make_pixel_bucket(missing_target), 'a b c d -> (a b c d)')
+            missing_target_vector = rearrange(make_pixel_bucket(missing_target), 'a d -> (a d)')
             missing_vector.append(missing_target_vector)
     return need_update, missing_index, missing_vector, missing_file_name
 
