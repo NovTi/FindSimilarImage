@@ -1,0 +1,237 @@
+
+
+
+Weird:
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
+line 344: text_input_ids is int 64, but on cpu not on xpu
+
+
+
+source code change:
+arc:
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/torch/nn/functional.py
+
+line 5  import pdb
+line 2209   add pdb.set_trace()
+
+cpx:
+/disk0/miniconda3/envs/yuxuan-test/lib/python3.9/site-packages/torch/nn/functional.py
+
+Todo:
+cpx: python -m ov_test_demo  (evaluate)  
+修改到SPR上跑evaulate，并且把SPR上面的测试时间更新到nano下面的issue里
+arc: 修改代码让arc也支持stable diffusion
+继续写notebook，添加更多的comments
+scipy/six
+
+
+bugs:
+1. 
+error:
+RuntimeError: Expected tensor for argument #1 'indices' to have one of the following scalar types: Long, Int; but got XPUHalfType instead (while checking arguments for embedding)
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/torch/nn/functional.py, line 2210
+torch.embedding的input需要是int型，但是/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/bigdl/nano/deps/ipex/ipex_inference_xpu_model.py下的PytorchIPEXPUModel的forward会强制把input转为给定的precision(eg. float16)，在/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/bigdl/nano/diffusion/diffusers/pipelines/stable_diffusion.py", line344，call text_encoder -> call PytorchIPEXPUModel forward -> cast input to given percision (float16)
+
+目前在functional line 2210 强制把float16 转为int64，可以work
+后续需要找人问这个bug究竟在哪里修，functional是torch内部文件，不能修改
+
+
+2.
+RuntimeError: Expected all tensors to be on the same device, but found at least two devices, xpu:0 and cpu!
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/diffusers/schedulers/scheduling_lms_discrete.py
+
+line 252  add  to('xpu')
+line 253   add  sample = sample.to('xpu')  (add line)
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
+
+!!!StableDiffusionPipeline sets self.device at the __init__ function, however, NanoStableDiffusionPipeline inheritage this pipeline and replace the unet, vae, text_encoder to xpu and quantized type. But the self.device did not change!!!
+I believe image2image also has this problem
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/diffusers/configuration_utils.py：
+
+self.register_modules sets the self.device
+->
+_execution_device: not hasattr(self.unet, "_hf_hook") is True -> return self.device
+->
+pipeline_stable_diffusion line 638
+self.scheduler.set_timesteps(num_inference_steps, device=device) device is cpu
+-> 
+diffusers/schedulers/scheduling_lms_discrete.py line 208
+self.sigmas.to(device=device) 
+->
+pipeline_stable_diffusion line 680  
+latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample  
+->
+diffusers/schedulers/scheduling_lms_discrete.py line 257
+pred_original_sample = sample - sigma * model_output
+model_output: xpu, sigma: cpu, sample: cpu
+-> cause error
+
+sample is the parameter of this function but sigma is the attribute of the class
+
+
+3.
+RuntimeError: Input type (float) and bias type (c10::Half) should be the same
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/torch/nn/modules/conv.py
+看cpu那块这个conv是什么类型的数据
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py
+line 17  add import pdb
+line 655 add latents = latents.to(torch.float16)
+line 654   add pdb.set_trace()  (add line)
+
+Needs to find the reason!!!!
+
+
+/disk0/miniconda3/envs/yuxuan-test/lib/python3.9/site-packages/diffusers/models/autoencoder_kl.py
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/diffusers/models/autoencoder_kl.py
+
+the cpu one: decode step is still float32 but gpu one is float16
+cpx: self.vae.model.encoder.conv_in.weight.dtype
+
+arc: self.vae.encoder.conv_in.weight.dtype
+
+
+cpx: 
+/home/cpx/miniconda3/envs/yuxuan-test/lib/python3.9/site-packages/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion.py  
+line 424 decode_latents function:
+self.vae is on bfloat16, but the input latents is float32 where exactly does self.vae.decode cast latents to bfloat16
+
+weird: when I am inside the decode function in vae, the parameters all became float32 (autoencoder_kl line171), but outside when I call self.vae.decode, the parameters are bfloat16(pipeline_stable_diffusion line 427)
+
+
+
+# Todo
+vae encoder decoder / text encoder  on cpu 
+set text_encoder : cpu device, float 32
+unet: gpu
+
+绕过了第一个bug，但是仍然有两个bug
+
+1. 同上述bug no.2， StableDiffusionPipeline, self.device不能返回module.device，只能返回cpu(现在vae, text_encoder都在cpu上，即使能过kwargs那块，返回的也会是cpu)
+
+2. vae在cpu上，但是unet在xpu上，unet返回的latents仍然需要vae的decoder来decode，cpu与xpu device errorq
+
+
+/opt/anaconda3/envs/yuxuan-sd/lib/python3.9/site-packages/bigdl/nano/pytorch/inference/optimizer.py
+
+
+
+
+
+Run autogen on local LLM
+--model-path ../../llm-models/Llama-2-7b-hf/
+
+Setup server: 
+1. launch the controller
+2. launch the model worker (the https_proxy, http_proxy, no_proxy should all be none) 
+3. launch the API server (this has problem)
+
+export https_proxy=""
+
+when testing, https_proxy and http_proxy should be None.   no_proxy should be "localhost"!!!
+
+completion现在可以运行，在/home/arda/miniconda3/envs/yuxuan-autogen/lib/python3.9/site-packages/autogen/oai/completion.py
+line 220 openai.api_key = "EMPTY"
+line 221 openai.api_base = "http://localhost:8000/v1"
+
+Notice, it will store the answer to cache. If testing with same set of prompts(line 203). It will jump the api calling part
+
+
+This somehow failed to produce API, 
+curl http://localhost:8000/v1/models  can't show the model
+
+Running Fastchat API on ARC:
+
+python -m fastchat.serve.controller
+
+python -m fastchat.serve.model_worker --model-path /mnt/disk1/models/Llama-2-7b-chat-hf --device xpu
+(python -m fastchat.serve.model_worker --model-path /mnt/disk1/models/Llama-2-7b-chat-hf --device xpu --bigdl_load)
+
+python -m fastchat.serve.openai_api_server --host localhost --port 8000
+
+fastchat/serve/cli line 226 chat_loop -> fastchat/serve/inference  line 360 load_model  -> fastchat/model/model_adapter  line 217  if deice=='xpu': intel_extension_for_pytorch as ipex
+
+Check memory usage on ARC:
+sudo xpu-smi stats -d 0
+
+
+This line use ipex optimize:
+fastchat/model/model_adapter  line 328   model = torch.xpu.optimize
+
+One potiential problem:
+fastchat/model/model_adapter  line 218   kwargs = {"torch_dtype": torch.bfloat16},  if it only supports bfloat16 percision, ARC device will cause error because it does not support 
+
+
+Current finding:
+python -m fastchat.serve.model_worker --model-path YOUR_MODEL_PATH
+This step somehow goes through the fastchat/model/model_adapter line 164 function load_model
+
+
+arc autogen:
+model path:   /mnt/disk1/models/Llama-2-7b-chat-hf
+
+Current Error:
+1 . openai.error.APIError: Invalid response object from API: '{"object":"error","message":"Only  allowed now, your model Llama-2-7b-chat-hf","code":40301}' (HTTP response code was 400)
+
+2. openai.error.APIError: Invalid response object from API: '{"object":"error","message":"**NETWORK ERROR DUE TO HIGH TRAFFIC. PLEASE REGENERATE OR REFRESH THIS PAGE.**\\n\\n(Allocation is out of device memory on current platform.)","code":50001}' (HTTP response code was 400)
+
+Might be the memory issue, but needs more
+
+check memory on ARC:  sudo xpu-smi stats -d 0
+
+测试下来的感受： 经过一次bad request之后就无法正常调用api了，比如chat先跑到内存不够返回error，之后gpu内存是够的，但是再次调用api时就无法运行
+
+Error: assert r.status_code == 200
+
+Running Fastchat API on CPU:
+
+python -m fastchat.serve.controller
+
+python -m fastchat.serve.model_worker --model-path /disk1/changmin/Llama-2-7b-chat-hf --device cpu
+
+python -m fastchat.serve.openai_api_server --host localhost --port 8000
+
+BUGs:
+
+openai.error.Timeout: Request timed out: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=60): 怀疑是cpu推理太慢导致回复超时，而被判定为time out
+
+openai.error.ServiceUnavailableError: The server is overloaded or not ready yet.   bash窗口没有设export no_proxy
+
+
+model.lm_head.weight.dtype
+
+CPU:
+bigdl load_in_4bit: 74s
+bigdl not load_in_4bit: 13s
+
+GPU:
+bigdl load_in_4bit: 8s
+bigdl not load_in_4bit: 13s
+
+
+no bigdl 65s
+
+
+对于example，命令行跑 sys加模型地址的参数？
+对于修改过的fastchat push到哪
+
+
+明确非bigdl load时用的哪些code，具体是什么device， datatype，github
+
+accuracy不一致的问题也要记录
+速度不一样，但是output也不一样
+
+官方，ipex，bigdl优化过后的输出
+cpu：ipex: float32    bigdl: (load_in_4bit=True) unit8 or int4?, (load_in_4bit=False) float32
+
+放github的链接，对于xpu优化的地方
+
+gpu：ipex: bfloat16   bigdl: (load_in_4bit=True) unit8  or int4?, (load_in_4bit=False) bfloat16
+
+
+GPU下面创建application
